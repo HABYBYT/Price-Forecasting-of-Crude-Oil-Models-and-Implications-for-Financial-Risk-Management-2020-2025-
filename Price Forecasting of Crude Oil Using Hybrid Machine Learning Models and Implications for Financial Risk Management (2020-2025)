@@ -1,0 +1,1212 @@
+# -*- coding: utf-8 -*-
+"""
+Price Forecasting of Crude Oil Using Hybrid Machine Learning Models
+and Implications for Financial Risk Management (2020-2025)
+================================================================================
+This script automatically downloads data via Yahoo Finance and executes:
+- Adaptive exponential smoothing for the COVID-19 period
+- Models: ARIMA, SARIMA, LSTM, GRU, XGBoost, LightGBM, Prophet, Stacking
+- Time series cross-validation
+- Risk metrics (VaR, stress testing)
+- Visualizations and comprehensive report
+"""
+
+# =============================================================================
+# 1. PACKAGE INSTALLATION (if necessary)
+# =============================================================================
+
+import subprocess
+import sys
+import pkg_resources
+
+required_packages = [
+    'yfinance', 'pandas', 'numpy', 'matplotlib', 'seaborn', 
+    'statsmodels', 'scikit-learn', 'tensorflow', 'arch', 
+    'plotly', 'jinja2', 'joblib', 'xgboost', 'lightgbm', 
+    'prophet', 'pmdarima', 'scipy'
+]
+
+def install_packages():
+    """Installs missing packages"""
+    installed = {pkg.key for pkg in pkg_resources.working_set}
+    missing = [pkg for pkg in required_packages if pkg not in installed]
+    
+    if missing:
+        print(f"📦 Installing missing packages: {missing}")
+        for package in missing:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", package])
+        print("✅ All packages are installed")
+    else:
+        print("✅ All packages are already installed")
+
+install_packages()
+
+# =============================================================================
+# 2. LIBRARY IMPORTS
+# =============================================================================
+
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from datetime import datetime, timedelta
+import warnings
+warnings.filterwarnings('ignore')
+
+# Statistics and models
+from statsmodels.tsa.arima.model import ARIMA
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+from pmdarima import auto_arima
+from scipy import stats
+from scipy.stats import norm
+
+# Machine Learning
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error, mean_absolute_percentage_error
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.linear_model import LinearRegression
+
+# Deep Learning
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, GRU, Dense, Dropout, Input
+from tensorflow.keras.optimizers import Adam
+
+# Gradient Boosting
+import xgboost as xgb
+import lightgbm as lgb
+
+# Prophet
+from prophet import Prophet
+
+# Visualization
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+# Utilities
+import os
+import zipfile
+import json
+
+# =============================================================================
+# 3. CONFIGURATION
+# =============================================================================
+
+# Create results folder
+os.makedirs('results_oil_price', exist_ok=True)
+
+# Graph configuration
+sns.set_style("whitegrid")
+plt.rcParams['figure.figsize'] = (12, 6)
+pd.set_option('display.float_format', '{:.4f}'.format)
+
+# Parameters
+TICKER = 'CL=F'  # WTI Crude Oil Futures
+START_DATE = '2020-01-01'
+END_DATE = '2025-12-31'
+TRAIN_CV_RATIO = 0.8
+N_SPLITS = 3
+FUTURE_DAYS = 30
+WINDOW = 20
+
+# COVID-19 parameters
+COVID_START = '2020-03-01'
+COVID_END = '2020-06-30'
+ALPHA_NORMAL = 0.3
+ALPHA_COVID = 0.7
+
+# Model parameters
+SEQUENCE_LENGTH = 30
+EPOCHS = 50
+BATCH_SIZE = 32
+RANDOM_SEED = 42
+VAR_CONFIDENCE = 0.95
+
+# Set seeds for reproducibility
+np.random.seed(RANDOM_SEED)
+tf.random.set_seed(RANDOM_SEED)
+
+# =============================================================================
+# 4. AUTOMATIC DATA DOWNLOAD FROM YAHOO FINANCE
+# =============================================================================
+
+print("\n" + "="*60)
+print("📥 AUTOMATIC DATA DOWNLOAD FROM YAHOO FINANCE")
+print("="*60)
+
+try:
+    # Download data
+    print(f"Downloading {TICKER} from {START_DATE} to {END_DATE}...")
+    df = yf.download(TICKER, start=START_DATE, end=END_DATE, progress=False)
+    
+    if df.empty:
+        raise ValueError("No data downloaded. Check the ticker.")
+    
+    # Extract closing prices
+    data_raw = df[['Close']].copy().dropna()
+    data_raw.columns = ['Price']
+    
+    print(f"✅ Data downloaded successfully!")
+    print(f"   • Period: {data_raw.index[0].date()} → {data_raw.index[-1].date()}")
+    print(f"   • Observations: {data_raw.shape[0]} days")
+    print(f"   • Average price: ${data_raw['Price'].mean():.2f}")
+    print(f"   • Min price: ${data_raw['Price'].min():.2f}")
+    print(f"   • Max price: ${data_raw['Price'].max():.2f}")
+    
+except Exception as e:
+    print(f"❌ Error during download: {e}")
+    print("🔄 Attempting with simulated data for demonstration...")
+    
+    # Simulated data in case of failure (so script continues)
+    dates = pd.date_range(start=START_DATE, end=END_DATE, freq='B')
+    np.random.seed(RANDOM_SEED)
+    
+    # Simulate oil price with trend and volatility
+    n = len(dates)
+    returns = np.random.normal(0.0001, 0.02, n)
+    price = 50 * np.exp(np.cumsum(returns))
+    
+    # Add some shocks (COVID-19)
+    covid_idx = (dates >= pd.Timestamp(COVID_START)) & (dates <= pd.Timestamp(COVID_END))
+    price[covid_idx] = price[covid_idx] * 0.6  # 40% drop
+    
+    data_raw = pd.DataFrame({'Price': price}, index=dates)
+    print("⚠️ Using simulated data for demonstration")
+
+# =============================================================================
+# 5. ADAPTIVE EXPONENTIAL SMOOTHING (FOR COVID-19)
+# =============================================================================
+
+print("\n" + "="*60)
+print("📊 ADAPTIVE EXPONENTIAL SMOOTHING")
+print("="*60)
+
+def adaptive_smoothing(series, alpha_norm, alpha_covid, covid_start, covid_end):
+    """Applies exponential smoothing with adaptive parameter during COVID-19"""
+    smoothed = series.copy()
+    ema = series.ewm(alpha=alpha_norm, adjust=False).mean()
+    
+    mask = (series.index >= pd.Timestamp(covid_start)) & (series.index <= pd.Timestamp(covid_end))
+    if mask.any():
+        ema_covid = series[mask].ewm(alpha=alpha_covid, adjust=False).mean()
+        ema.loc[mask] = ema_covid
+    
+    return ema.fillna(method='ffill').fillna(method='bfill')
+
+data = data_raw.copy()
+data['Price_smoothed'] = adaptive_smoothing(
+    data['Price'], ALPHA_NORMAL, ALPHA_COVID, COVID_START, COVID_END
+)
+
+# Visualization
+plt.figure(figsize=(14,6))
+plt.plot(data.index, data['Price'], 'b-', alpha=0.4, linewidth=1, label='Original price')
+plt.plot(data.index, data['Price_smoothed'], 'r-', linewidth=2, label='Smoothed price (adaptive)')
+plt.axvspan(pd.Timestamp(COVID_START), pd.Timestamp(COVID_END), 
+            alpha=0.2, color='red', label='COVID-19 period')
+plt.title('WTI Price: Original vs Adaptive Exponential Smoothing', fontsize=14, fontweight='bold')
+plt.xlabel('Date')
+plt.ylabel('Price (USD)')
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.savefig('results_oil_price/price_smoothed.png', dpi=150)
+plt.show()
+
+# Use the smoothed series
+data['Price'] = data['Price_smoothed']
+data = data[['Price']].copy()
+
+# Calculate returns
+data['Returns'] = data['Price'].pct_change() * 100
+data = data.dropna()
+
+print(f"\nReturns statistics:")
+print(f"   • Mean: {data['Returns'].mean():.4f}%")
+print(f"   • Volatility: {data['Returns'].std():.4f}%")
+print(f"   • Skewness: {stats.skew(data['Returns']):.4f}")
+print(f"   • Kurtosis: {stats.kurtosis(data['Returns']):.4f}")
+
+# =============================================================================
+# 6. FEATURE CREATION
+# =============================================================================
+
+print("\n" + "="*60)
+print("🔧 FEATURE CREATION")
+print("="*60)
+
+def create_features(df, lags=5, windows=[5, 10, 20]):
+    """Creates features for ML models"""
+    dataf = df.copy()
+    
+    # Price lags
+    for lag in range(1, lags+1):
+        dataf[f'lag_{lag}'] = dataf['Price'].shift(lag)
+    
+    # Moving averages and standard deviations
+    for w in windows:
+        dataf[f'ma_{w}'] = dataf['Price'].rolling(window=w).mean()
+        dataf[f'std_{w}'] = dataf['Price'].rolling(window=w).std()
+    
+    # Return
+    dataf['return'] = dataf['Price'].pct_change()
+    
+    return dataf.dropna()
+
+data_feat = create_features(data)
+print(f"✅ Features created: {data_feat.shape[1]-1} explanatory variables")
+print(f"   Final shape: {data_feat.shape}")
+
+# =============================================================================
+# 7. TRAIN/TEST SPLIT
+# =============================================================================
+
+split_idx = int(len(data_feat) * TRAIN_CV_RATIO)
+train = data_feat.iloc[:split_idx].copy()
+test = data_feat.iloc[split_idx:].copy()
+
+print(f"\n📅 Train/test split:")
+print(f"   • Train: {train.index[0].date()} → {train.index[-1].date()} ({len(train)} obs)")
+print(f"   • Test:  {test.index[0].date()} → {test.index[-1].date()} ({len(test)} obs)")
+
+y_train = train['Price']
+y_test = test['Price']
+X_train = train.drop('Price', axis=1)
+X_test = test.drop('Price', axis=1)
+
+# Normalization
+scaler_X = StandardScaler()
+scaler_y = StandardScaler()
+
+X_train_scaled = scaler_X.fit_transform(X_train)
+X_test_scaled = scaler_X.transform(X_test)
+y_train_scaled = scaler_y.fit_transform(y_train.values.reshape(-1, 1)).flatten()
+y_test_scaled = scaler_y.transform(y_test.values.reshape(-1, 1)).flatten()
+
+# =============================================================================
+# 8. SEQUENCE PREPARATION FOR LSTM/GRU
+# =============================================================================
+
+def create_sequences(data, seq_length):
+    """Creates sequences for recurrent models"""
+    X, y = [], []
+    for i in range(seq_length, len(data)):
+        X.append(data[i-seq_length:i])
+        y.append(data[i])
+    return np.array(X), np.array(y)
+
+price_series = data['Price'].loc[data_feat.index]
+X_seq, y_seq = create_sequences(price_series.values, SEQUENCE_LENGTH)
+seq_dates = price_series.index[SEQUENCE_LENGTH:]
+
+train_seq_idx = int(len(X_seq) * TRAIN_CV_RATIO)
+X_seq_train, X_seq_test = X_seq[:train_seq_idx], X_seq[train_seq_idx:]
+y_seq_train, y_seq_test = y_seq[:train_seq_idx], y_seq[train_seq_idx:]
+dates_seq_train = seq_dates[:train_seq_idx]
+dates_seq_test = seq_dates[train_seq_idx:]
+
+# Sequence normalization
+scaler_seq = StandardScaler()
+X_seq_train_2d = X_seq_train.reshape(-1, SEQUENCE_LENGTH)
+X_seq_test_2d = X_seq_test.reshape(-1, SEQUENCE_LENGTH)
+X_seq_train_scaled = scaler_seq.fit_transform(X_seq_train_2d).reshape(-1, SEQUENCE_LENGTH, 1)
+X_seq_test_scaled = scaler_seq.transform(X_seq_test_2d).reshape(-1, SEQUENCE_LENGTH, 1)
+
+scaler_seq_y = StandardScaler()
+y_seq_train_scaled = scaler_seq_y.fit_transform(y_seq_train.reshape(-1, 1)).flatten()
+y_seq_test_scaled = scaler_seq_y.transform(y_seq_test.reshape(-1, 1)).flatten()
+
+# =============================================================================
+# 9. MODEL DEFINITIONS
+# =============================================================================
+
+print("\n" + "="*60)
+print("🤖 MODEL DEFINITIONS")
+print("="*60)
+
+def train_arima(y, horizon):
+    """Trains an ARIMA model"""
+    model = auto_arima(y, seasonal=False, trace=False, 
+                       error_action='ignore', suppress_warnings=True)
+    return model
+
+def train_sarima(y, horizon):
+    """Trains a SARIMA model"""
+    model = auto_arima(y, seasonal=True, m=30, trace=False, 
+                       error_action='ignore', suppress_warnings=True)
+    return model
+
+def build_lstm(input_shape):
+    """Builds an LSTM model"""
+    model = Sequential([
+        Input(shape=input_shape),
+        LSTM(64, return_sequences=True),
+        Dropout(0.2),
+        LSTM(32),
+        Dropout(0.2),
+        Dense(16, activation='relu'),
+        Dense(1)
+    ])
+    model.compile(optimizer=Adam(0.001), loss='mse', metrics=['mae'])
+    return model
+
+def build_gru(input_shape):
+    """Builds a GRU model"""
+    model = Sequential([
+        Input(shape=input_shape),
+        GRU(64, return_sequences=True),
+        Dropout(0.2),
+        GRU(32),
+        Dropout(0.2),
+        Dense(16, activation='relu'),
+        Dense(1)
+    ])
+    model.compile(optimizer=Adam(0.001), loss='mse', metrics=['mae'])
+    return model
+
+def train_xgboost(X_train, y_train):
+    """Trains an XGBoost model"""
+    model = xgb.XGBRegressor(
+        objective='reg:squarederror',
+        n_estimators=100,
+        max_depth=5,
+        random_state=RANDOM_SEED
+    )
+    model.fit(X_train, y_train)
+    return model
+
+def train_lightgbm(X_train, y_train):
+    """Trains a LightGBM model"""
+    model = lgb.LGBMRegressor(
+        objective='regression',
+        n_estimators=100,
+        max_depth=5,
+        random_state=RANDOM_SEED,
+        verbose=-1
+    )
+    model.fit(X_train, y_train)
+    return model
+
+def train_prophet(df):
+    """Trains a Prophet model"""
+    model = Prophet(yearly_seasonality=True, weekly_seasonality=True, daily_seasonality=False)
+    model.fit(df)
+    return model
+
+def train_stacking(X_train, y_train, X_val, y_val):
+    """Trains a Stacking model (XGBoost + LightGBM + NN)"""
+    
+    # Base models
+    model1 = xgb.XGBRegressor(n_estimators=50, max_depth=3, random_state=RANDOM_SEED)
+    model2 = lgb.LGBMRegressor(n_estimators=50, max_depth=3, random_state=RANDOM_SEED, verbose=-1)
+    
+    # Small neural network
+    model3 = Sequential([
+        Input(shape=(X_train.shape[1],)),
+        Dense(32, activation='relu'),
+        Dropout(0.2),
+        Dense(16, activation='relu'),
+        Dropout(0.2),
+        Dense(1)
+    ])
+    model3.compile(optimizer=Adam(0.001), loss='mse')
+    
+    # Training
+    model1.fit(X_train, y_train)
+    model2.fit(X_train, y_train)
+    model3.fit(X_train, y_train, epochs=20, batch_size=16, verbose=0)
+    
+    # Predictions for meta-model
+    pred1 = model1.predict(X_val)
+    pred2 = model2.predict(X_val)
+    pred3 = model3.predict(X_val).flatten()
+    
+    # Meta-model (linear regression)
+    meta_X = np.column_stack([pred1, pred2, pred3])
+    meta_model = LinearRegression()
+    meta_model.fit(meta_X, y_val)
+    
+    return {'models': [model1, model2, model3], 'meta': meta_model}
+
+print("✅ Models defined successfully")
+
+# =============================================================================
+# 10. TIME SERIES CROSS-VALIDATION (CORRECTED)
+# =============================================================================
+
+print("\n" + "="*60)
+print("🔄 TIME SERIES CROSS-VALIDATION (3 FOLDS)")
+print("="*60)
+
+tscv = TimeSeriesSplit(n_splits=N_SPLITS)
+model_names = ['ARIMA', 'SARIMA', 'LSTM', 'GRU', 'XGBoost', 'LightGBM', 'Prophet', 'Stacking']
+cv_scores = {name: [] for name in model_names}
+fold = 0
+
+for train_idx, val_idx in tscv.split(train):
+    fold += 1
+    print(f"\n--- Fold {fold}/{N_SPLITS} ---")
+    
+    train_fold = train.iloc[train_idx]
+    val_fold = train.iloc[val_idx]
+    
+    y_train_fold = train_fold['Price']
+    y_val_fold = val_fold['Price']
+    X_train_fold = train_fold.drop('Price', axis=1)
+    X_val_fold = val_fold.drop('Price', axis=1)
+    
+    # Normalization
+    scaler_fold_X = StandardScaler()
+    scaler_fold_y = StandardScaler()
+    
+    X_tr_scaled = scaler_fold_X.fit_transform(X_train_fold)
+    X_val_scaled = scaler_fold_X.transform(X_val_fold)
+    y_tr_scaled = scaler_fold_y.fit_transform(y_train_fold.values.reshape(-1, 1)).flatten()
+    
+    # ARIMA
+    try:
+        arima_model = train_arima(y_train_fold, len(y_val_fold))
+        pred_arima = arima_model.predict(n_periods=len(y_val_fold))
+        rmse_arima = np.sqrt(mean_squared_error(y_val_fold, pred_arima))
+        cv_scores['ARIMA'].append(rmse_arima)
+        print(f"   ✅ ARIMA RMSE: {rmse_arima:.4f}")
+    except Exception as e:
+        cv_scores['ARIMA'].append(np.nan)
+        print(f"   ❌ ARIMA: failed - {str(e)[:50]}")
+    
+    # SARIMA
+    try:
+        sarima_model = train_sarima(y_train_fold, len(y_val_fold))
+        pred_sarima = sarima_model.predict(n_periods=len(y_val_fold))
+        rmse_sarima = np.sqrt(mean_squared_error(y_val_fold, pred_sarima))
+        cv_scores['SARIMA'].append(rmse_sarima)
+        print(f"   ✅ SARIMA RMSE: {rmse_sarima:.4f}")
+    except Exception as e:
+        cv_scores['SARIMA'].append(np.nan)
+        print(f"   ❌ SARIMA: failed - {str(e)[:50]}")
+    
+    # XGBoost
+    try:
+        xgb_model = train_xgboost(X_tr_scaled, y_tr_scaled)
+        pred_xgb_scaled = xgb_model.predict(X_val_scaled)
+        pred_xgb = scaler_fold_y.inverse_transform(pred_xgb_scaled.reshape(-1, 1)).flatten()
+        rmse_xgb = np.sqrt(mean_squared_error(y_val_fold, pred_xgb))
+        cv_scores['XGBoost'].append(rmse_xgb)
+        print(f"   ✅ XGBoost RMSE: {rmse_xgb:.4f}")
+    except Exception as e:
+        cv_scores['XGBoost'].append(np.nan)
+        print(f"   ❌ XGBoost: failed - {str(e)[:50]}")
+    
+    # LightGBM
+    try:
+        lgb_model = train_lightgbm(X_tr_scaled, y_tr_scaled)
+        pred_lgb_scaled = lgb_model.predict(X_val_scaled)
+        pred_lgb = scaler_fold_y.inverse_transform(pred_lgb_scaled.reshape(-1, 1)).flatten()
+        rmse_lgb = np.sqrt(mean_squared_error(y_val_fold, pred_lgb))
+        cv_scores['LightGBM'].append(rmse_lgb)
+        print(f"   ✅ LightGBM RMSE: {rmse_lgb:.4f}")
+    except Exception as e:
+        cv_scores['LightGBM'].append(np.nan)
+        print(f"   ❌ LightGBM: failed - {str(e)[:50]}")
+    
+    # Prophet
+    try:
+        prophet_train = train_fold[['Price']].reset_index()
+        prophet_train.columns = ['ds', 'y']
+        prophet_model = train_prophet(prophet_train)
+        future = prophet_model.make_future_dataframe(periods=len(y_val_fold))
+        forecast = prophet_model.predict(future)
+        pred_prophet = forecast['yhat'].values[-len(y_val_fold):]
+        rmse_prophet = np.sqrt(mean_squared_error(y_val_fold, pred_prophet))
+        cv_scores['Prophet'].append(rmse_prophet)
+        print(f"   ✅ Prophet RMSE: {rmse_prophet:.4f}")
+    except Exception as e:
+        cv_scores['Prophet'].append(np.nan)
+        print(f"   ❌ Prophet: failed - {str(e)[:50]}")
+    
+    # Prepare sequences for LSTM/GRU
+    train_fold_dates = train_fold.index
+    val_fold_dates = val_fold.index
+    
+    # Create mapping from dates to sequence indices
+    date_to_seq_idx_train = {d: i for i, d in enumerate(dates_seq_train) if d in dates_seq_train}
+    date_to_seq_idx_test = {d: i for i, d in enumerate(dates_seq_test) if d in dates_seq_test}
+    
+    train_seq_idx_fold = [date_to_seq_idx_train[d] for d in train_fold_dates if d in date_to_seq_idx_train]
+    val_seq_idx_fold = [date_to_seq_idx_test[d] for d in val_fold_dates if d in date_to_seq_idx_test]
+    
+    # LSTM
+    try:
+        if len(train_seq_idx_fold) > 5 and len(val_seq_idx_fold) > 0:
+            X_tr_seq = X_seq_train_scaled[train_seq_idx_fold]
+            y_tr_seq = y_seq_train_scaled[train_seq_idx_fold]
+            X_val_seq = X_seq_test_scaled[val_seq_idx_fold]
+            
+            if len(X_tr_seq) > 0 and len(X_val_seq) > 0:
+                lstm_model = build_lstm((SEQUENCE_LENGTH, 1))
+                lstm_model.fit(X_tr_seq, y_tr_seq, epochs=20, batch_size=16, verbose=0)
+                pred_lstm_scaled = lstm_model.predict(X_val_seq, verbose=0).flatten()
+                pred_lstm = scaler_seq_y.inverse_transform(pred_lstm_scaled.reshape(-1, 1)).flatten()
+                
+                # Align indices
+                pred_lstm_series = pd.Series(pred_lstm, index=[d for d in val_fold_dates if d in date_to_seq_idx_test])
+                common_dates = pred_lstm_series.index.intersection(y_val_fold.index)
+                
+                if len(common_dates) > 0:
+                    rmse_lstm = np.sqrt(mean_squared_error(
+                        y_val_fold.loc[common_dates], 
+                        pred_lstm_series.loc[common_dates]
+                    ))
+                    cv_scores['LSTM'].append(rmse_lstm)
+                    print(f"   ✅ LSTM RMSE: {rmse_lstm:.4f}")
+                else:
+                    cv_scores['LSTM'].append(np.nan)
+                    print(f"   ❌ LSTM: no common dates")
+            else:
+                cv_scores['LSTM'].append(np.nan)
+                print(f"   ❌ LSTM: insufficient sequences")
+        else:
+            cv_scores['LSTM'].append(np.nan)
+            print(f"   ❌ LSTM: not enough sequential data")
+    except Exception as e:
+        cv_scores['LSTM'].append(np.nan)
+        print(f"   ❌ LSTM: failed - {str(e)[:50]}")
+    
+    # GRU
+    try:
+        if len(train_seq_idx_fold) > 5 and len(val_seq_idx_fold) > 0:
+            X_tr_seq = X_seq_train_scaled[train_seq_idx_fold]
+            y_tr_seq = y_seq_train_scaled[train_seq_idx_fold]
+            X_val_seq = X_seq_test_scaled[val_seq_idx_fold]
+            
+            if len(X_tr_seq) > 0 and len(X_val_seq) > 0:
+                gru_model = build_gru((SEQUENCE_LENGTH, 1))
+                gru_model.fit(X_tr_seq, y_tr_seq, epochs=20, batch_size=16, verbose=0)
+                pred_gru_scaled = gru_model.predict(X_val_seq, verbose=0).flatten()
+                pred_gru = scaler_seq_y.inverse_transform(pred_gru_scaled.reshape(-1, 1)).flatten()
+                
+                # Align indices
+                pred_gru_series = pd.Series(pred_gru, index=[d for d in val_fold_dates if d in date_to_seq_idx_test])
+                common_dates = pred_gru_series.index.intersection(y_val_fold.index)
+                
+                if len(common_dates) > 0:
+                    rmse_gru = np.sqrt(mean_squared_error(
+                        y_val_fold.loc[common_dates], 
+                        pred_gru_series.loc[common_dates]
+                    ))
+                    cv_scores['GRU'].append(rmse_gru)
+                    print(f"   ✅ GRU RMSE: {rmse_gru:.4f}")
+                else:
+                    cv_scores['GRU'].append(np.nan)
+                    print(f"   ❌ GRU: no common dates")
+            else:
+                cv_scores['GRU'].append(np.nan)
+                print(f"   ❌ GRU: insufficient sequences")
+        else:
+            cv_scores['GRU'].append(np.nan)
+            print(f"   ❌ GRU: not enough sequential data")
+    except Exception as e:
+        cv_scores['GRU'].append(np.nan)
+        print(f"   ❌ GRU: failed - {str(e)[:50]}")
+    
+    # Stacking
+    try:
+        split2 = max(1, int(0.8 * len(X_tr_scaled)))
+        if split2 < len(X_tr_scaled) and len(X_tr_scaled) > 10:
+            X_tr2, y_tr2 = X_tr_scaled[:split2], y_tr_scaled[:split2]
+            X_val2, y_val2 = X_tr_scaled[split2:], y_tr_scaled[split2:]
+            
+            if len(X_tr2) > 0 and len(X_val2) > 0:
+                stacking_models = train_stacking(X_tr2, y_tr2, X_val2, y_val2)
+                
+                pred1 = stacking_models['models'][0].predict(X_val_scaled)
+                pred2 = stacking_models['models'][1].predict(X_val_scaled)
+                pred3 = stacking_models['models'][2].predict(X_val_scaled).flatten()
+                meta_X = np.column_stack([pred1, pred2, pred3])
+                pred_stacking_scaled = stacking_models['meta'].predict(meta_X)
+                pred_stacking = scaler_fold_y.inverse_transform(pred_stacking_scaled.reshape(-1, 1)).flatten()
+                
+                rmse_stacking = np.sqrt(mean_squared_error(y_val_fold, pred_stacking))
+                cv_scores['Stacking'].append(rmse_stacking)
+                print(f"   ✅ Stacking RMSE: {rmse_stacking:.4f}")
+            else:
+                cv_scores['Stacking'].append(np.nan)
+                print(f"   ❌ Stacking: insufficient data")
+        else:
+            cv_scores['Stacking'].append(np.nan)
+            print(f"   ❌ Stacking: invalid split")
+    except Exception as e:
+        cv_scores['Stacking'].append(np.nan)
+        print(f"   ❌ Stacking: failed - {str(e)[:50]}")
+
+# =============================================================================
+# 11. CV RESULTS SUMMARY (CORRECTED)
+# =============================================================================
+
+print("\n" + "="*60)
+print("📊 CROSS-VALIDATION RESULTS")
+print("="*60)
+
+# Ensure all lists have the same length
+for model in model_names:
+    while len(cv_scores[model]) < N_SPLITS:
+        cv_scores[model].append(np.nan)
+        print(f"⚠️  Added NaN for {model} (missing values)")
+
+# Create DataFrame
+cv_df = pd.DataFrame(cv_scores)
+print("\nScores by fold:")
+print(cv_df.round(4))
+
+# Calculate means and standard deviations ignoring NaN
+cv_mean = cv_df.mean(skipna=True).round(4).sort_values()
+cv_std = cv_df.std(skipna=True).round(4)
+
+cv_summary = pd.DataFrame({
+    'Model': cv_mean.index,
+    'Avg_RMSE': cv_mean.values,
+    'RMSE_std': [cv_std[m] for m in cv_mean.index],
+    'Successful_folds': cv_df.count().values
+}).reset_index(drop=True)
+
+print("\n" + "="*60)
+print("📊 CROSS-VALIDATION RESULTS")
+print("="*60)
+print(cv_summary.to_string(index=False))
+
+# Save
+cv_summary.to_csv('results_oil_price/cv_results.csv', index=False)
+cv_df.to_csv('results_oil_price/cv_folds.csv')
+
+# Best model (ignore NaN)
+cv_mean_clean = cv_mean.dropna()
+if len(cv_mean_clean) > 0:
+    best_model = cv_mean_clean.idxmin()
+    best_rmse_cv = cv_mean_clean.min()
+    print(f"\n🏆 Best model: {best_model} (CV RMSE = {best_rmse_cv:.4f})")
+else:
+    # Fallback to Stacking if everything failed
+    best_model = 'Stacking'
+    best_rmse_cv = np.nan
+    print(f"\n⚠️  All models failed, using Stacking as default")
+
+# =============================================================================
+# 12. FINAL TRAINING AND TEST EVALUATION (CORRECTED WITH FALLBACK)
+# =============================================================================
+
+print("\n" + "="*60)
+print(f"🔄 FINAL TRAINING: {best_model}")
+print("="*60)
+
+# Variable to store predictions and errors
+pred_test = None
+errors_test = None
+
+try:
+    if best_model == 'ARIMA':
+        model_final = train_arima(y_train, len(y_test))
+        pred_test = model_final.predict(n_periods=len(y_test))
+        
+    elif best_model == 'SARIMA':
+        model_final = train_sarima(y_train, len(y_test))
+        pred_test = model_final.predict(n_periods=len(y_test))
+        
+    elif best_model == 'LSTM':
+        model_final = build_lstm((SEQUENCE_LENGTH, 1))
+        model_final.fit(X_seq_train_scaled, y_seq_train_scaled, 
+                       epochs=EPOCHS, batch_size=BATCH_SIZE, verbose=0)
+        pred_scaled = model_final.predict(X_seq_test_scaled, verbose=0).flatten()
+        pred_test = scaler_seq_y.inverse_transform(pred_scaled.reshape(-1, 1)).flatten()
+        pred_test = pd.Series(pred_test, index=dates_seq_test)
+        
+    elif best_model == 'GRU':
+        model_final = build_gru((SEQUENCE_LENGTH, 1))
+        model_final.fit(X_seq_train_scaled, y_seq_train_scaled, 
+                       epochs=EPOCHS, batch_size=BATCH_SIZE, verbose=0)
+        pred_scaled = model_final.predict(X_seq_test_scaled, verbose=0).flatten()
+        pred_test = scaler_seq_y.inverse_transform(pred_scaled.reshape(-1, 1)).flatten()
+        pred_test = pd.Series(pred_test, index=dates_seq_test)
+        
+    elif best_model == 'XGBoost':
+        model_final = train_xgboost(X_train_scaled, y_train_scaled)
+        pred_scaled = model_final.predict(X_test_scaled)
+        pred_test = scaler_y.inverse_transform(pred_scaled.reshape(-1, 1)).flatten()
+        
+    elif best_model == 'LightGBM':
+        model_final = train_lightgbm(X_train_scaled, y_train_scaled)
+        pred_scaled = model_final.predict(X_test_scaled)
+        pred_test = scaler_y.inverse_transform(pred_scaled.reshape(-1, 1)).flatten()
+        
+    elif best_model == 'Prophet':
+        prophet_train = train[['Price']].reset_index()
+        prophet_train.columns = ['ds', 'y']
+        model_final = train_prophet(prophet_train)
+        future = model_final.make_future_dataframe(periods=len(y_test))
+        forecast = model_final.predict(future)
+        pred_test = forecast['yhat'].values[-len(y_test):]
+        
+    elif best_model == 'Stacking':
+        split2 = int(0.8 * len(X_train_scaled))
+        if split2 >= len(X_train_scaled):
+            split2 = len(X_train_scaled) // 2
+        X_tr2, y_tr2 = X_train_scaled[:split2], y_train_scaled[:split2]
+        X_val2, y_val2 = X_train_scaled[split2:], y_train_scaled[split2:]
+        
+        stacking_models = train_stacking(X_tr2, y_tr2, X_val2, y_val2)
+        model_final = stacking_models
+        
+        pred1 = stacking_models['models'][0].predict(X_test_scaled)
+        pred2 = stacking_models['models'][1].predict(X_test_scaled)
+        pred3 = stacking_models['models'][2].predict(X_test_scaled).flatten()
+        meta_X = np.column_stack([pred1, pred2, pred3])
+        pred_scaled = stacking_models['meta'].predict(meta_X)
+        pred_test = scaler_y.inverse_transform(pred_scaled.reshape(-1, 1)).flatten()
+    
+    # If we have predictions, calculate metrics
+    if pred_test is not None:
+        # Alignment for LSTM/GRU
+        if best_model in ['LSTM', 'GRU']:
+            common_dates = pred_test.index.intersection(y_test.index)
+            if len(common_dates) > 0:
+                y_test_aligned = y_test.loc[common_dates]
+                pred_test_aligned = pred_test.loc[common_dates]
+                errors_test = y_test_aligned.values - pred_test_aligned.values
+                y_test_for_metrics = y_test_aligned
+                pred_test_for_metrics = pred_test_aligned
+            else:
+                raise ValueError("No common dates between predictions and test")
+        else:
+            errors_test = y_test.values - pred_test
+            y_test_for_metrics = y_test
+            pred_test_for_metrics = pred_test
+        
+        # Performance metrics
+        rmse_test = np.sqrt(mean_squared_error(y_test_for_metrics, pred_test_for_metrics))
+        mae_test = mean_absolute_error(y_test_for_metrics, pred_test_for_metrics)
+        mape_test = mean_absolute_percentage_error(y_test_for_metrics, pred_test_for_metrics) * 100
+        
+        print(f"\n📈 Test set performance:")
+        print(f"   • RMSE: {rmse_test:.4f} $")
+        print(f"   • MAE:  {mae_test:.4f} $")
+        print(f"   • MAPE: {mape_test:.2f}%")
+        
+        # Visualization
+        plt.figure(figsize=(14,6))
+        if best_model in ['LSTM', 'GRU']:
+            plt.plot(y_test_aligned.index, y_test_aligned, 'k-', linewidth=2, label='Actual price')
+            plt.plot(pred_test_aligned.index, pred_test_aligned, 'r--', linewidth=2, 
+                    label=f'{best_model} prediction')
+        else:
+            plt.plot(y_test.index, y_test, 'k-', linewidth=2, label='Actual price')
+            plt.plot(y_test.index, pred_test, 'r--', linewidth=2, label=f'{best_model} prediction')
+        plt.title(f'WTI Price Forecasts on Test Set - {best_model}', 
+                  fontsize=14, fontweight='bold')
+        plt.xlabel('Date')
+        plt.ylabel('Price (USD)')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig('results_oil_price/forecast_test.png', dpi=150)
+        plt.show()
+        
+    else:
+        raise ValueError("No predictions generated")
+
+except Exception as e:
+    print(f"\n❌ Error during {best_model} training: {e}")
+    print("🔄 Using XGBoost as fallback model...")
+    
+    # Fallback model
+    best_model = 'XGBoost'
+    model_final = train_xgboost(X_train_scaled, y_train_scaled)
+    pred_scaled = model_final.predict(X_test_scaled)
+    pred_test = scaler_y.inverse_transform(pred_scaled.reshape(-1, 1)).flatten()
+    errors_test = y_test.values - pred_test
+    
+    rmse_test = np.sqrt(mean_squared_error(y_test, pred_test))
+    mae_test = mean_absolute_error(y_test, pred_test)
+    mape_test = mean_absolute_percentage_error(y_test, pred_test) * 100
+    
+    print(f"\n📈 Performance (fallback model):")
+    print(f"   • RMSE: {rmse_test:.4f} $")
+    print(f"   • MAE:  {mae_test:.4f} $")
+    print(f"   • MAPE: {mape_test:.2f}%")
+    
+    plt.figure(figsize=(14,6))
+    plt.plot(y_test.index, y_test, 'k-', linewidth=2, label='Actual price')
+    plt.plot(y_test.index, pred_test, 'r--', linewidth=2, label=f'{best_model} prediction (fallback)')
+    plt.title('WTI Price Forecasts - XGBoost Fallback Model', fontsize=14, fontweight='bold')
+    plt.xlabel('Date')
+    plt.ylabel('Price (USD)')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig('results_oil_price/forecast_test_fallback.png', dpi=150)
+    plt.show()
+
+# =============================================================================
+# 13. RISK ANALYSIS - VALUE AT RISK (VaR)
+# =============================================================================
+
+print("\n" + "="*60)
+print("📊 RISK ANALYSIS - VALUE AT RISK (VaR)")
+print("="*60)
+
+def calculate_risk_metrics(errors, confidence_level=0.95):
+    """Calculates risk metrics from forecast errors"""
+    
+    # Basic statistics
+    std_error = np.std(errors)
+    mae = np.mean(np.abs(errors))
+    rmse = np.sqrt(np.mean(errors**2))
+    
+    # Value-at-Risk
+    var_loss = np.percentile(errors, (1 - confidence_level) * 100)
+    var_gain = np.percentile(errors, confidence_level * 100)
+    
+    # Expected Shortfall (Conditional VaR)
+    cvar_loss = np.mean(errors[errors <= var_loss]) if len(errors[errors <= var_loss]) > 0 else var_loss
+    cvar_gain = np.mean(errors[errors >= var_gain]) if len(errors[errors >= var_gain]) > 0 else var_gain
+    
+    # Confidence interval
+    ci_lower = np.percentile(errors, 2.5)
+    ci_upper = np.percentile(errors, 97.5)
+    
+    # Stress scenarios
+    stress_2x = std_error * 2
+    stress_3x = std_error * 3
+    stress_5x = std_error * 5
+    
+    # Asymmetry
+    var_asymmetry = abs(var_loss) / abs(var_gain) if var_gain != 0 else np.nan
+    
+    metrics = {
+        'Std Dev (σ_e)': round(std_error, 4),
+        'MAE': round(mae, 4),
+        'RMSE': round(rmse, 4),
+        f'VaR {int(confidence_level*100)}% (Loss)': round(var_loss, 4),
+        f'VaR {int(confidence_level*100)}% (Gain)': round(var_gain, 4),
+        'VaR Asymmetry Ratio': round(var_asymmetry, 2) if not np.isnan(var_asymmetry) else 'N/A',
+        'CVaR 95% (Loss)': round(cvar_loss, 4),
+        'CVaR 95% (Gain)': round(cvar_gain, 4),
+        '95% CI (lower)': round(ci_lower, 4),
+        '95% CI (upper)': round(ci_upper, 4),
+        'Moderate Stress (2× σ_e)': round(stress_2x, 4),
+        'Severe Stress (3× σ_e)': round(stress_3x, 4),
+        'Extreme Stress (5× σ_e)': round(stress_5x, 4),
+    }
+    
+    return metrics
+
+# Calculate risk metrics
+risk_metrics = calculate_risk_metrics(errors_test, confidence_level=0.95)
+risk_metrics['99% VaR (Loss)'] = round(np.percentile(errors_test, 1), 4)
+risk_metrics['99% VaR (Gain)'] = round(np.percentile(errors_test, 99), 4)
+
+# Display metrics
+print("\n📉 RISK METRICS:")
+print("-" * 50)
+categories = {
+    'Error Statistics': ['Std Dev (σ_e)', 'MAE', 'RMSE'],
+    'Value-at-Risk (95%)': ['VaR 95% (Loss)', 'VaR 95% (Gain)', 'VaR Asymmetry Ratio'],
+    'Conditional VaR': ['CVaR 95% (Loss)', 'CVaR 95% (Gain)'],
+    'Confidence Intervals': ['95% CI (lower)', '95% CI (upper)'],
+    'Stress Scenarios': ['Moderate Stress (2× σ_e)', 'Severe Stress (3× σ_e)', 'Extreme Stress (5× σ_e)']
+}
+
+for category, metric_names in categories.items():
+    print(f"\n{category}:")
+    for name in metric_names:
+        if name in risk_metrics:
+            value = risk_metrics[name]
+            if isinstance(value, float):
+                if 'Loss' in name:
+                    print(f"  • {name:<25}: {value:>10.4f} $ (downside risk)")
+                elif 'Gain' in name:
+                    print(f"  • {name:<25}: {value:>10.4f} $ (upside potential)")
+                elif 'Stress' in name:
+                    print(f"  • {name:<25}: {value:>10.4f} $")
+                elif 'CI' in name:
+                    if 'lower' in name:
+                        print(f"  • {name:<25}: {value:>10.4f} $ (lower bound)")
+                    else:
+                        print(f"  • {name:<25}: {value:>10.4f} $ (upper bound)")
+                else:
+                    print(f"  • {name:<25}: {value:>10.4f}")
+            else:
+                print(f"  • {name:<25}: {value:>10}")
+
+# Risk dashboard
+print("\n" + "▓"*60)
+print(" "*15 + "RISK MANAGEMENT DASHBOARD")
+print("▓"*60)
+
+position_size = 10000  # 10,000 barrels
+current_price = y_test.iloc[-1] if hasattr(y_test, 'iloc') else y_test[-1]
+
+position_risk_95 = abs(risk_metrics['VaR 95% (Loss)']) * position_size
+position_risk_99 = abs(risk_metrics['99% VaR (Loss)']) * position_size
+
+print(f"\n📊 POSITION RISK (for {position_size:,} barrels):")
+print(f"   • Current price: ${current_price:.2f}/bbl")
+print(f"   • Position value: ${position_size * current_price:,.2f}")
+print(f"   • 95% VaR (loss): ${position_risk_95:,.2f}")
+print(f"   • 99% VaR (loss): ${position_risk_99:,.2f}")
+print(f"   • Required capital (95%): ${position_risk_95:,.2f}")
+print(f"   • Risk/position ratio: {position_risk_95/(position_size * current_price)*100:.2f}%")
+
+print(f"\n⚠️ STRESS SCENARIOS:")
+print(f"   • Moderate (2× σ_e): ${risk_metrics['Moderate Stress (2× σ_e)']:.4f}/barrel")
+print(f"     → Total impact: ${risk_metrics['Moderate Stress (2× σ_e)'] * position_size:,.2f}")
+print(f"   • Severe (3× σ_e): ${risk_metrics['Severe Stress (3× σ_e)']:.4f}/barrel")
+print(f"     → Total impact: ${risk_metrics['Severe Stress (3× σ_e)'] * position_size:,.2f}")
+print(f"   • Extreme (5× σ_e): ${risk_metrics['Extreme Stress (5× σ_e)']:.4f}/barrel")
+print(f"     → Total impact: ${risk_metrics['Extreme Stress (5× σ_e)'] * position_size:,.2f}")
+
+# Error distribution visualization
+fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+# Histogram
+axes[0, 0].hist(errors_test, bins=50, density=True, alpha=0.7, color='steelblue', edgecolor='black')
+axes[0, 0].axvline(risk_metrics['VaR 95% (Loss)'], color='red', linestyle='--', 
+                   linewidth=2, label=f"VaR Loss: ${risk_metrics['VaR 95% (Loss)']:.4f}")
+axes[0, 0].axvline(risk_metrics['VaR 95% (Gain)'], color='green', linestyle='--', 
+                   linewidth=2, label=f"VaR Gain: ${risk_metrics['VaR 95% (Gain)']:.4f}")
+axes[0, 0].axvline(0, color='black', linestyle='-', linewidth=1)
+axes[0, 0].set_title('Forecast Error Distribution with VaR Thresholds', fontsize=12)
+axes[0, 0].set_xlabel('Forecast Error ($)')
+axes[0, 0].set_ylabel('Density')
+axes[0, 0].legend()
+axes[0, 0].grid(True, alpha=0.3)
+
+# Q-Q plot
+stats.probplot(errors_test, dist="norm", plot=axes[0, 1])
+axes[0, 1].set_title('Q-Q Plot (Normality Test)', fontsize=12)
+axes[0, 1].grid(True, alpha=0.3)
+
+# Box plot
+axes[1, 0].boxplot(errors_test, vert=False)
+axes[1, 0].axvline(0, color='black', linestyle='-', linewidth=1)
+axes[1, 0].axvline(risk_metrics['VaR 95% (Loss)'], color='red', linestyle='--', linewidth=2)
+axes[1, 0].axvline(risk_metrics['VaR 95% (Gain)'], color='green', linestyle='--', linewidth=2)
+axes[1, 0].set_title('Box Plot of Forecast Errors', fontsize=12)
+axes[1, 0].set_xlabel('Forecast Error ($)')
+axes[1, 0].grid(True, alpha=0.3)
+
+# Cumulative distribution function
+axes[1, 1].hist(errors_test, bins=50, density=True, cumulative=True, 
+                alpha=0.7, color='purple', edgecolor='black')
+axes[1, 1].axvline(risk_metrics['VaR 95% (Loss)'], color='red', linestyle='--', 
+                   linewidth=2, label=f"VaR Loss (5%)")
+axes[1, 1].axvline(risk_metrics['VaR 95% (Gain)'], color='green', linestyle='--', 
+                   linewidth=2, label=f"VaR Gain (95%)")
+axes[1, 1].axhline(0.05, color='red', linestyle=':', alpha=0.5)
+axes[1, 1].axhline(0.95, color='green', linestyle=':', alpha=0.5)
+axes[1, 1].set_title('Cumulative Distribution Function', fontsize=12)
+axes[1, 1].set_xlabel('Forecast Error ($)')
+axes[1, 1].set_ylabel('Cumulative Probability')
+axes[1, 1].legend()
+axes[1, 1].grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.savefig('results_oil_price/risk_analysis.png', dpi=150)
+plt.show()
+
+# =============================================================================
+# 14. 30-DAY FUTURE FORECAST
+# =============================================================================
+
+print("\n" + "="*60)
+print("🔮 30-DAY FUTURE FORECAST")
+print("="*60)
+
+future_dates = pd.date_range(start=y_test.index[-1] + timedelta(days=1), 
+                             periods=FUTURE_DAYS, freq='D')
+
+if best_model in ['ARIMA', 'SARIMA']:
+    future_pred = model_final.predict(n_periods=FUTURE_DAYS)
+    future_pred = pd.Series(future_pred, index=future_dates)
+    
+elif best_model == 'Prophet':
+    future = model_final.make_future_dataframe(periods=FUTURE_DAYS)
+    forecast = model_final.predict(future)
+    future_pred = forecast['yhat'].values[-FUTURE_DAYS:]
+    future_pred = pd.Series(future_pred, index=future_dates)
+    
+elif best_model in ['LSTM', 'GRU']:
+    last_sequence = X_seq_test_scaled[-1]
+    future_pred_scaled = []
+    for _ in range(FUTURE_DAYS):
+        pred = model_final.predict(last_sequence.reshape(1, SEQUENCE_LENGTH, 1), verbose=0).flatten()[0]
+        future_pred_scaled.append(pred)
+        last_sequence = np.roll(last_sequence, -1, axis=0)
+        last_sequence[-1] = pred
+    future_pred = scaler_seq_y.inverse_transform(np.array(future_pred_scaled).reshape(-1, 1)).flatten()
+    future_pred = pd.Series(future_pred, index=future_dates)
+    
+elif best_model == 'Stacking':
+    history = list(y_test.values[-min(20, len(y_test)):])
+    future_pred = []
+    feature_names = X_train.columns.tolist()
+    
+    for i in range(FUTURE_DAYS):
+        feat_dict = {name: 0.0 for name in feature_names}
+        
+        # Lags
+        for lag in range(1, 6):
+            if len(history) >= lag:
+                feat_dict[f'lag_{lag}'] = history[-lag]
+        
+        # Moving averages
+        if len(history) >= 5:
+            feat_dict['ma_5'] = np.mean(history[-5:])
+            feat_dict['std_5'] = np.std(history[-5:])
+        if len(history) >= 10:
+            feat_dict['ma_10'] = np.mean(history[-10:])
+            feat_dict['std_10'] = np.std(history[-10:])
+        if len(history) >= 20:
+            feat_dict['ma_20'] = np.mean(history[-20:])
+            feat_dict['std_20'] = np.std(history[-20:])
+        
+        # Return
+        if len(history) >= 2 and history[-2] != 0:
+            feat_dict['return'] = (history[-1] - history[-2]) / history[-2]
+        
+        features = np.array([feat_dict[name] for name in feature_names]).reshape(1, -1)
+        features_scaled = scaler_X.transform(features)
+        
+        pred1 = model_final['models'][0].predict(features_scaled)[0]
+        pred2 = model_final['models'][1].predict(features_scaled)[0]
+        pred3 = model_final['models'][2].predict(features_scaled).flatten()[0]
+        meta_features = np.array([[pred1, pred2, pred3]])
+        pred_scaled = model_final['meta'].predict(meta_features)[0]
+        pred = scaler_y.inverse_transform([[pred_scaled]])[0, 0]
+        
+        future_pred.append(pred)
+        history.append(pred)
+    
+    future_pred = pd.Series(future_pred, index=future_dates)
+    
+else:
+    future_pred = pd.Series(index=future_dates)
+    print("⚠️ Future forecast not available for this model")
+
+if len(future_pred) > 0:
+    # Visualization
+    plt.figure(figsize=(14,6))
+    plt.plot(train.index[-60:], train['Price'].iloc[-60:], 'b-', linewidth=2, label='History (train)')
+    plt.plot(test.index, test['Price'], 'k-', linewidth=2, label='Test')
+    plt.plot(future_dates, future_pred, 'r--', linewidth=2, label=f'{best_model} forecast (30d)')
+    plt.axvline(y_test.index[-1], color='gray', linestyle=':', alpha=0.7)
+    plt.title(f'WTI Price 30-Day Forecast - {best_model}', fontsize=14, fontweight='bold')
+    plt.xlabel('Date')
+    plt.ylabel('Price (USD)')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig('results_oil_price/future_forecast.png', dpi=150)
+    plt.show()
+    
+    # Save
+    future_df = pd.DataFrame({'Date': future_dates, 'Forecast': future_pred})
+    future_df.to_csv('results_oil_price/future_forecast.csv', index=False)
+    print(f"✅ Future forecasts saved to 'results_oil_price/future_forecast.csv'")
+    
+    # Forecast statistics
+    print(f"\n📊 30-day forecast statistics:")
+    print(f"   • Average forecast price: ${future_pred.mean():.2f}")
+    print(f"   • Min forecast price: ${future_pred.min():.2f}")
+    print(f"   • Max forecast price: ${future_pred.max():.2f}")
+    print(f"   • Trend: {'Bullish 📈' if future_pred.iloc[-1] > future_pred.iloc[0] else 'Bearish 📉'}")
+
+# =============================================================================
+# 15. SAVE RESULTS
+# =============================================================================
+
+print("\n" + "="*60)
+print("💾 SAVING RESULTS")
+print("="*60)
+
+# Save risk metrics
+risk_df = pd.DataFrame([risk_metrics]).T
+risk_df.columns = ['Value']
+risk_df.to_csv('results_oil_price/risk_metrics.csv')
+print("✅ Risk metrics saved")
+
+# Final summary
+summary = {
+    'Selected model': best_model,
+    'CV RMSE': best_rmse_cv,
+    'Test RMSE': rmse_test,
+    'Test MAE': mae_test,
+    'Test MAPE (%)': mape_test,
+    'Std Errors': risk_metrics['Std Dev (σ_e)'],
+    'VaR 95% (Loss)': risk_metrics['VaR 95% (Loss)'],
+    'VaR 95% (Gain)': risk_metrics['VaR 95% (Gain)'],
+    'Start date': data.index[0].strftime('%Y-%m-%d'),
+    'End date': data.index[-1].strftime('%Y-%m-%d'),
+    'Observations': len(data)
+}
+
+summary_df = pd.DataFrame([summary]).T
+summary_df.columns = ['Value']
+summary_df.to_csv('results_oil_price/summary.csv')
+print("✅ Summary saved")
+
+# Create ZIP archive
+with zipfile.ZipFile('results_oil_price.zip', 'w') as zipf:
+    for root, dirs, files in os.walk('results_oil_price'):
+        for file in files:
+            zipf.write(os.path.join(root, file), arcname=file)
+print("✅ ZIP archive created: results_oil_price.zip")
+
+# =============================================================================
+# 16. FINAL REPORT
+# =============================================================================
+
+print("\n" + "★"*60)
+print(" "*20 + "FINAL REPORT")
+print("★"*60)
+print(f"""
+📋 ANALYSIS SUMMARY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📅 Analysis period: {data.index[0].date()} → {data.index[-1].date()}
+📊 Observations: {len(data)} days
+
+🏆 BEST MODEL: {best_model}
+   • CV RMSE: {best_rmse_cv:.4f} $
+   • Test RMSE: {rmse_test:.4f} $
+   • Test MAE: {mae_test:.4f} $
+   • Test MAPE: {mape_test:.2f}%
+
+📉 RISK METRICS
+   • Error standard deviation: {risk_metrics['Std Dev (σ_e)']:.4f} $
+   • 95% VaR (loss): {risk_metrics['VaR 95% (Loss)']:.4f} $
+   • 95% VaR (gain): {risk_metrics['VaR 95% (Gain)']:.4f} $
+   • 95% Confidence Interval: [{risk_metrics['95% CI (lower)']:.4f}, {risk_metrics['95% CI (upper)']:.4f}] $
+
+⚠️ STRESS SCENARIOS (for 10,000 barrels)
+   • Moderate (2×): ${risk_metrics['Moderate Stress (2× σ_e)'] * 10000:,.2f}
+   • Severe (3×): ${risk_metrics['Severe Stress (3× σ_e)'] * 10000:,.2f}
+   • Extreme (5×): ${risk_metrics['Extreme Stress (5× σ_e)'] * 10000:,.2f}
+
+🔮 30-DAY FORECAST
+   • Average forecast price: ${future_pred.mean():.2f}
+   • Range: [{future_pred.min():.2f}, {future_pred.max():.2f}] $
+   • Trend: {'📈 Bullish' if future_pred.iloc[-1] > future_pred.iloc[0] else '📉 Bearish'}
+
+📁 Generated files in 'results_oil_price/'
+   • price_smoothed.png - Adaptive smoothing graph
+   • forecast_test.png - Test set forecasts
+   • future_forecast.png - 30-day forecasts
+   • risk_analysis.png - Risk analysis (VaR)
+   • cv_results.csv - Cross-validation results
+   • risk_metrics.csv - Detailed risk metrics
+   • future_forecast.csv - Future forecasts
+   • summary.csv - Analysis summary
+   • results_oil_price.zip - Complete archive
+
+✅ Analysis completed successfully!
+""")
